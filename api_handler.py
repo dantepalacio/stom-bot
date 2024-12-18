@@ -21,7 +21,7 @@ from langchain.globals import set_verbose
 from langchain.schema import ChatMessage, BaseChatMessageHistory
 
 
-set_verbose(True)
+
 
 from dotenv import load_dotenv
 
@@ -36,62 +36,68 @@ REDIS_URL=os.environ.get('REDIS_URL')
 openai.api_key = OPENAI_API_KEY
 client = openai.OpenAI()
 
-
 # Путь к файлу для хранения истории
 CHAT_HISTORY_FILE = "chat_history.json"
 
 # Функция для загрузки истории чата из JSON
 def load_chat_history() -> dict:
     if os.path.exists(CHAT_HISTORY_FILE):
-        print('store exists')
         with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as file:
             return json.load(file)
     return {}
 
-def get_session_messages(session_id: str) -> list:
+def get_session_messages(user_id: str, session_id: str) -> list:
     """
-    Возвращает историю сообщений для session_id в виде списка словарей.
+    Возвращает историю сообщений для заданного user_id и session_id в виде списка словарей.
     """
-    session_id = str(session_id)
     store = load_chat_history()
 
-    # Если сессия отсутствует, возвращаем пустой список
-    if session_id not in store:
-        print('FUUUUUCK NOT IN STORE')
+    # Проверяем, существует ли пользователь
+    user_id = str(user_id)
+    if user_id not in store:
         return []
 
-    # Возвращаем историю сообщений
-    return store[session_id]
+    # Проверяем, существует ли сессия
+    sessions = store[user_id]
+    if session_id not in sessions:
+        return []
+
+    # Возвращаем сообщения текущей сессии
+    return sessions[session_id]
+
+
 # Функция для сохранения истории чата в JSON
 def save_chat_history(store: dict):
     with open(CHAT_HISTORY_FILE, "w", encoding="utf-8") as file:
         json.dump(store, file, ensure_ascii=False, indent=4)
 
 # Универсальная функция для управления историей чата
-def get_session_history(session_id: str, new_message=None) -> BaseChatMessageHistory:
+def get_session_history(user_id: str, session_id: str, new_message=None) -> BaseChatMessageHistory:
     """
-    Возвращает объект ChatMessageHistory для session_id.
-    Если передан параметр new_message, обновляет историю в JSON.
+    Возвращает объект ChatMessageHistory для заданного user_id и session_id.
+    Если передан new_message, обновляет историю.
     """
-    session_id = str(session_id)
-    # Загружаем историю из JSON
     store = load_chat_history()
 
-    # Если сессия отсутствует, создаём новую
-    if session_id not in store:
-        store[session_id] = []
+    # Инициализация пользователя и сессии
+    user_id = str(user_id)
+    session_id = str(session_id)
+
+    if user_id not in store:
+        store[user_id] = {}
+    if session_id not in store[user_id]:
+        store[user_id][session_id] = []
 
     # Добавляем новое сообщение, если передано
     if new_message:
-        store[session_id].append({"role": new_message.role, "content": new_message.content})
+        store[user_id][session_id].append({"role": new_message.role, "content": new_message.content})
         save_chat_history(store)  # Сохраняем изменения
 
     # Возвращаем объект ChatMessageHistory
     history = ChatMessageHistory(messages=[
         ChatMessage(role=message["role"], content=message["content"])
-        for message in store[session_id]
+        for message in store[user_id][session_id]
     ])
-    
     return history
 
 def format_chat_history(messages: list) -> str:
@@ -173,7 +179,8 @@ def binary_classify(text:str) -> json:
     return answer
 
 
-def get_chain(retriever):
+def get_chain(retriever, user_id, session_id):
+    set_verbose(True)
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0.4
@@ -205,9 +212,12 @@ def get_chain(retriever):
 
     rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
+    def get_session_history_wrapper():
+        return get_session_history(user_id, session_id)
+
     conversational_rag_chain = RunnableWithMessageHistory(
         rag_chain,
-        get_session_history,  # Используем единую функцию
+        get_session_history_wrapper,  
         input_messages_key="input",
         history_messages_key="chat_history",
         output_messages_key="answer",
@@ -228,35 +238,35 @@ def get_retrievers(pages):
 
     return ensemble_retriever
 
-def qa(user_query, user_id):
+def qa(user_query, user_id, session_id):
     embeddings = OpenAIEmbeddings()
     db_vector = FAISS.load_local(r"faiss_index", embeddings, allow_dangerous_deserialization=True)
     retriever = db_vector.as_retriever()
-    chat_chain = get_chain(retriever)
+    chat_chain = get_chain(retriever, user_id, session_id)
 
     # Добавляем запрос пользователя в историю
-    get_session_history(user_id, new_message=ChatMessage(role="user", content=user_query))
+    get_session_history(user_id, session_id, new_message=ChatMessage(role="user", content=user_query))
 
     # Выполнение цепочки
     response = chat_chain.invoke(
         {"input": user_query},
-        config={
-            "configurable": {"session_id": user_id}
-        },
+        # config={
+        #     "configurable": {"user_id": user_id, "session_id":session_id}
+        # },
     )
 
     # Добавляем ответ бота в историю
     bot_message = response["answer"]
-    get_session_history(user_id, new_message=ChatMessage(role="assistant", content=bot_message))
+    get_session_history(user_id, session_id, new_message=ChatMessage(role="assistant", content=bot_message))
 
     # Логируем обновленную историю чата
-    chat_history = get_session_messages(user_id)
-    print(f'{type(chat_history)} {chat_history}')
+    chat_history = get_session_messages(user_id, session_id)
     updated_chat_history = format_chat_history(chat_history[-4:])
-    print("\n\n\nФорматированная история", updated_chat_history)
 
     # Классификация ответа
     status_answer = binary_classify(updated_chat_history)
+
+    print(f'STATUS ANSWER: {status_answer}')
 
     if status_answer == '1':
         summary = summary_history(updated_chat_history)
@@ -265,7 +275,7 @@ def qa(user_query, user_id):
         summary = None
         recs = None
 
-    result = {'bot_message': bot_message, 'trigger': status_answer, 'summary':summary, 'recs':recs}
+    result = {'bot_message': bot_message, 'trigger': status_answer, 'summary': summary, 'recs': recs}
     return result
 
 if __name__=='__main__':
