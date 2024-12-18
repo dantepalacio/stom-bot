@@ -1,0 +1,8 @@
+aiogram 
+openai 
+langchain 
+langchain_openai 
+langchain_community
+faiss-cpu
+gspread 
+oauth2client
